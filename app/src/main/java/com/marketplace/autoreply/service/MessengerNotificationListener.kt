@@ -202,31 +202,44 @@ class MessengerNotificationListener : NotificationListenerService() {
             }
         }
 
+        // Check if AI mode is enabled FIRST - AI mode has no stage limits
+        val isAIEnabled = app.preferencesManager.isAIEnabled.first()
+
         // Get existing user record to determine current stage
         val existingUser = app.database.repliedUserDao().getUser(senderId)
         val currentStage = existingUser?.currentStage ?: 0 // 0 means new user
 
-        // Determine next stage
+        // Determine next stage - but ONLY enforce limits in static mode
         val nextStage = when (currentStage) {
             0 -> 1  // New user -> Stage 1 (Welcome)
             1 -> 2  // Was at Stage 1 -> Stage 2 (Follow-up)
             2 -> 3  // Was at Stage 2 -> Stage 3 (Contact sharing)
             3 -> {
-                // Already completed all stages - don't reply again
-                AppLogger.info(TAG, "All stages completed for $title")
-                app.database.activityLogDao().updateError(logId, ActivityStatus.IGNORED, "All stages completed")
-                synchronized(processLock) { processingSet.remove(senderId) }
-                return
+                // In AI mode, continue replying without limits
+                if (isAIEnabled) {
+                    AppLogger.info(TAG, "AI Mode: continuing conversation (no stage limit)")
+                    3 // Stay at stage 3, but continue replying
+                } else {
+                    // Static mode: stop after 3 stages
+                    AppLogger.info(TAG, "All stages completed for $title")
+                    app.database.activityLogDao().updateError(logId, ActivityStatus.IGNORED, "All stages completed")
+                    synchronized(processLock) { processingSet.remove(senderId) }
+                    return
+                }
             }
             else -> {
-                AppLogger.info(TAG, "Invalid stage for $title")
-                app.database.activityLogDao().updateError(logId, ActivityStatus.IGNORED, "Invalid stage")
-                synchronized(processLock) { processingSet.remove(senderId) }
-                return
+                if (isAIEnabled) {
+                    1 // Reset to stage 1 in AI mode
+                } else {
+                    AppLogger.info(TAG, "Invalid stage for $title")
+                    app.database.activityLogDao().updateError(logId, ActivityStatus.IGNORED, "Invalid stage")
+                    synchronized(processLock) { processingSet.remove(senderId) }
+                    return
+                }
             }
         }
 
-        AppLogger.info(TAG, "Stage $currentStage -> $nextStage for $title", showToast = true)
+        AppLogger.info(TAG, "Stage $currentStage -> $nextStage for $title (AI: $isAIEnabled)", showToast = true)
 
         // Check available methods
         val hasReplyActionAvailable = NotificationReplyHelper.hasReplyAction(notification)
@@ -240,8 +253,7 @@ class MessengerNotificationListener : NotificationListenerService() {
             return
         }
 
-        // Determine reply message - AI or Static
-        val isAIEnabled = app.preferencesManager.isAIEnabled.first()
+        // Determine reply message - AI or Static (isAIEnabled already checked above)
         var replyMessage: String
         var usedAI = false
         var tokensUsed = 0
