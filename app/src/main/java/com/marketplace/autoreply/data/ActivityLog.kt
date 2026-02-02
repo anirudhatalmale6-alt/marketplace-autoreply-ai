@@ -101,6 +101,9 @@ interface ActivityLogDao {
     @Query("UPDATE activity_log SET status = :status, generatedReply = :reply, usedAI = :usedAI, tokensUsed = :tokens, responseTimeMs = :responseTime WHERE id = :id")
     suspend fun updateReply(id: Long, status: String, reply: String, usedAI: Boolean, tokens: Int, responseTime: Long)
 
+    @Query("UPDATE activity_log SET status = :status, generatedReply = :reply, usedAI = :usedAI, tokensUsed = :tokens, responseTimeMs = :responseTime, errorMessage = :error WHERE id = :id")
+    suspend fun updateReplyWithError(id: Long, status: String, reply: String, usedAI: Boolean, tokens: Int, responseTime: Long, error: String)
+
     @Query("UPDATE activity_log SET status = :status, errorMessage = :error WHERE id = :id")
     suspend fun updateError(id: Long, status: String, error: String)
 

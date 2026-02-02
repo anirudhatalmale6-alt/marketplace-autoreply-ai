@@ -102,13 +102,32 @@ class ChatGPTService(private val preferencesManager: PreferencesManager) {
                 }
                 return@withContext ChatGPTResult.Error("Empty response from API")
             } else {
-                val errorStream = connection.errorStream?.bufferedReader()?.use { it.readText() } ?: "Unknown error"
+                val errorStream = connection.errorStream?.bufferedReader()?.use { it.readText() } ?: ""
                 AppLogger.error(TAG, "API Error $responseCode: $errorStream")
-                return@withContext ChatGPTResult.Error("API Error: $responseCode")
+
+                // Parse OpenAI error message for user-friendly display
+                val errorMessage = try {
+                    val errorJson = JSONObject(errorStream)
+                    errorJson.optJSONObject("error")?.optString("message") ?: "Unknown error"
+                } catch (e: Exception) {
+                    when (responseCode) {
+                        401 -> "Invalid API key"
+                        429 -> "Rate limit exceeded"
+                        500, 502, 503 -> "OpenAI server error"
+                        else -> "HTTP $responseCode"
+                    }
+                }
+                return@withContext ChatGPTResult.Error(errorMessage)
             }
+        } catch (e: java.net.UnknownHostException) {
+            AppLogger.error(TAG, "Network error: No internet")
+            return@withContext ChatGPTResult.Error("No internet connection")
+        } catch (e: java.net.SocketTimeoutException) {
+            AppLogger.error(TAG, "Network error: Timeout")
+            return@withContext ChatGPTResult.Error("Connection timeout")
         } catch (e: Exception) {
             AppLogger.error(TAG, "Exception: ${e.message}")
-            return@withContext ChatGPTResult.Error("Error: ${e.message}")
+            return@withContext ChatGPTResult.Error("Error: ${e.message?.take(50)}")
         }
     }
 

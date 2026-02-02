@@ -241,13 +241,16 @@ class MessengerNotificationListener : NotificationListenerService() {
         var replyMessage: String
         var usedAI = false
         var tokensUsed = 0
+        var aiError: String? = null  // Track AI errors for logging
 
         if (isAIEnabled) {
             // Try ChatGPT first
             val apiKey = app.preferencesManager.openAIApiKey.first()
+            AppLogger.info(TAG, "AI Mode ON, API Key: ${if (apiKey.length > 10) "${apiKey.take(8)}...${apiKey.takeLast(4)}" else "NOT SET"}", showToast = true)
+
             if (apiKey.isNotBlank()) {
                 val promptConfig = app.preferencesManager.getPromptConfig()
-                AppLogger.info(TAG, "Generating AI reply...", showToast = true)
+                AppLogger.info(TAG, "Calling ChatGPT API...", showToast = true)
 
                 when (val result = chatGPTService.generateReply(
                     senderName = title,
@@ -261,22 +264,24 @@ class MessengerNotificationListener : NotificationListenerService() {
                         replyMessage = result.reply
                         usedAI = true
                         tokensUsed = result.tokensUsed
-                        AppLogger.info(TAG, "AI reply ready", showToast = true)
+                        AppLogger.info(TAG, "AI reply OK (${tokensUsed} tokens)", showToast = true)
                     }
                     is ChatGPTResult.Error -> {
                         // Fallback to static message
-                        AppLogger.warn(TAG, "AI failed: ${result.message}, using fallback")
+                        aiError = result.message
+                        AppLogger.error(TAG, "ChatGPT ERROR: $aiError", showToast = true)
                         replyMessage = getStaticMessage(app, nextStage)
-                        app.database.activityLogDao().updateError(logId, ActivityStatus.AI_FAILED, result.message)
                     }
                 }
             } else {
                 // API key not set, use static
-                AppLogger.warn(TAG, "API key not set, using static message")
+                aiError = "API key not configured"
+                AppLogger.warn(TAG, "API key NOT SET - using static", showToast = true)
                 replyMessage = getStaticMessage(app, nextStage)
             }
         } else {
             // AI disabled, use static 3-stage messages
+            AppLogger.info(TAG, "AI Mode OFF - using static", showToast = true)
             replyMessage = getStaticMessage(app, nextStage)
         }
 
@@ -304,15 +309,21 @@ class MessengerNotificationListener : NotificationListenerService() {
                 // Direct reply was sent - record success with stage
                 val responseTime = System.currentTimeMillis() - startTime
                 recordSuccessfulReply(senderId, title, conversationTitle, sbn.packageName, nextStage, existingUser)
-                app.database.activityLogDao().updateReply(
+
+                // Preserve AI_FAILED status if AI failed but fallback was used
+                val finalStatus = if (aiError != null) ActivityStatus.AI_FAILED else ActivityStatus.REPLIED
+                app.database.activityLogDao().updateReplyWithError(
                     id = logId,
-                    status = ActivityStatus.REPLIED,
+                    status = finalStatus,
                     reply = replyMessage,
                     usedAI = usedAI,
                     tokens = tokensUsed,
-                    responseTime = responseTime
+                    responseTime = responseTime,
+                    error = aiError ?: ""
                 )
-                AppLogger.info(TAG, "Stage $nextStage sent to: $title", showToast = true)
+
+                val statusMsg = if (usedAI) "AI reply" else if (aiError != null) "Fallback (AI failed)" else "Static"
+                AppLogger.info(TAG, "$statusMsg sent to: $title", showToast = true)
                 synchronized(processLock) { processingSet.remove(senderId) }
                 return
             }
@@ -371,14 +382,21 @@ class MessengerNotificationListener : NotificationListenerService() {
         val responseTime = System.currentTimeMillis() - startTime
         if (accessibilitySuccess) {
             recordSuccessfulReply(senderId, title, conversationTitle, sbn.packageName, nextStage, existingUser)
-            app.database.activityLogDao().updateReply(
+
+            // Preserve AI_FAILED status if AI failed but fallback was used
+            val finalStatus = if (aiError != null) ActivityStatus.AI_FAILED else ActivityStatus.REPLIED
+            app.database.activityLogDao().updateReplyWithError(
                 id = logId,
-                status = ActivityStatus.REPLIED,
+                status = finalStatus,
                 reply = replyMessage,
                 usedAI = usedAI,
                 tokens = tokensUsed,
-                responseTime = responseTime
+                responseTime = responseTime,
+                error = aiError ?: ""
             )
+
+            val statusMsg = if (usedAI) "AI reply" else if (aiError != null) "Fallback (AI failed)" else "Static"
+            AppLogger.info(TAG, "$statusMsg sent via accessibility to: $title", showToast = true)
         } else {
             AppLogger.error(TAG, "Reply failed - check Accessibility", showToast = true)
             app.database.activityLogDao().updateError(logId, ActivityStatus.ERROR, "Accessibility reply failed")

@@ -432,8 +432,8 @@ class MainActivity : AppCompatActivity() {
                             ActivityStatus.REPLIED -> "OK"
                             ActivityStatus.SPAM -> "SPAM"
                             ActivityStatus.IGNORED -> "SKIP"
-                            ActivityStatus.ERROR -> "ERR"
-                            ActivityStatus.AI_FAILED -> "FALLBACK"
+                            ActivityStatus.ERROR -> "ERR: ${log.errorMessage.take(20)}"
+                            ActivityStatus.AI_FAILED -> "AI-ERR: ${log.errorMessage.take(25)}"
                             else -> log.status
                         }
                         "[$time] $aiTag ${log.senderName}: ${log.messageText.take(30)}... -> $status"
