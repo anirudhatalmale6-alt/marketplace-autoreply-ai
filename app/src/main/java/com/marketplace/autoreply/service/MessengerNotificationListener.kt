@@ -11,6 +11,8 @@ import com.marketplace.autoreply.data.ActivityStatus
 import com.marketplace.autoreply.data.AppLogger
 import com.marketplace.autoreply.data.ChatGPTResult
 import com.marketplace.autoreply.data.ChatGPTService
+import com.marketplace.autoreply.data.ConversationMessage
+import com.marketplace.autoreply.data.MessageRole
 import com.marketplace.autoreply.data.RepliedUser
 import com.marketplace.autoreply.data.SpamDetector
 import kotlinx.coroutines.CoroutineScope
@@ -243,6 +245,17 @@ class MessengerNotificationListener : NotificationListenerService() {
         var tokensUsed = 0
         var aiError: String? = null  // Track AI errors for logging
 
+        // Save incoming customer message to conversation history
+        app.database.conversationHistoryDao().insert(
+            ConversationMessage(
+                customerId = senderId,
+                customerName = title,
+                role = MessageRole.CUSTOMER,
+                content = messageText,
+                productTitle = productTitle
+            )
+        )
+
         if (isAIEnabled) {
             // Try ChatGPT first
             val apiKey = app.preferencesManager.openAIApiKey.first()
@@ -250,7 +263,12 @@ class MessengerNotificationListener : NotificationListenerService() {
 
             if (apiKey.isNotBlank()) {
                 val promptConfig = app.preferencesManager.getPromptConfig()
-                AppLogger.info(TAG, "Calling ChatGPT API...", showToast = true)
+
+                // Fetch conversation history for context (last 8 messages)
+                val conversationHistory = app.database.conversationHistoryDao()
+                    .getRecentMessages(senderId, limit = 8)
+                val historyCount = conversationHistory.size
+                AppLogger.info(TAG, "Calling ChatGPT with $historyCount history msgs...", showToast = true)
 
                 when (val result = chatGPTService.generateReply(
                     senderName = title,
@@ -258,13 +276,28 @@ class MessengerNotificationListener : NotificationListenerService() {
                     messageText = messageText,
                     fullNotification = fullText,
                     apiKey = apiKey,
-                    promptConfig = promptConfig
+                    promptConfig = promptConfig,
+                    conversationHistory = conversationHistory
                 )) {
                     is ChatGPTResult.Success -> {
                         replyMessage = result.reply
                         usedAI = true
                         tokensUsed = result.tokensUsed
                         AppLogger.info(TAG, "AI reply OK (${tokensUsed} tokens)", showToast = true)
+
+                        // Save AI reply to conversation history
+                        app.database.conversationHistoryDao().insert(
+                            ConversationMessage(
+                                customerId = senderId,
+                                customerName = title,
+                                role = MessageRole.ASSISTANT,
+                                content = replyMessage,
+                                productTitle = productTitle
+                            )
+                        )
+
+                        // Trim old messages to prevent database bloat
+                        app.database.conversationHistoryDao().trimOldMessages(senderId, keepCount = 20)
                     }
                     is ChatGPTResult.Error -> {
                         // Fallback to static message

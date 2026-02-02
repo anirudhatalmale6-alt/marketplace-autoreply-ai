@@ -33,6 +33,7 @@ class ChatGPTService(private val preferencesManager: PreferencesManager) {
      * @param fullNotification The full notification text for additional context
      * @param apiKey The OpenAI API key
      * @param promptConfig The user-configured prompt settings
+     * @param conversationHistory Previous messages with this customer (newest first)
      * @return Generated reply text or null if failed
      */
     suspend fun generateReply(
@@ -41,30 +42,47 @@ class ChatGPTService(private val preferencesManager: PreferencesManager) {
         messageText: String,
         fullNotification: String,
         apiKey: String,
-        promptConfig: PromptConfig
+        promptConfig: PromptConfig,
+        conversationHistory: List<ConversationMessage> = emptyList()
     ): ChatGPTResult = withContext(Dispatchers.IO) {
         try {
             if (apiKey.isBlank()) {
                 return@withContext ChatGPTResult.Error("API key not configured")
             }
 
-            val systemPrompt = buildSystemPrompt(promptConfig)
+            val systemPrompt = buildSystemPrompt(promptConfig, conversationHistory.isNotEmpty())
             val userPrompt = buildUserPrompt(senderName, productTitle, messageText, fullNotification)
+
+            // Build messages array with conversation history
+            val messagesArray = JSONArray().apply {
+                // System prompt first
+                put(JSONObject().apply {
+                    put("role", "system")
+                    put("content", systemPrompt)
+                })
+
+                // Add conversation history (reversed to chronological order, oldest first)
+                val historyReversed = conversationHistory.reversed()
+                for (msg in historyReversed) {
+                    val role = if (msg.role == MessageRole.CUSTOMER) "user" else "assistant"
+                    put(JSONObject().apply {
+                        put("role", role)
+                        put("content", msg.content)
+                    })
+                }
+
+                // Current message last
+                put(JSONObject().apply {
+                    put("role", "user")
+                    put("content", userPrompt)
+                })
+            }
 
             val requestBody = JSONObject().apply {
                 put("model", MODEL)
                 put("max_tokens", MAX_TOKENS)
                 put("temperature", TEMPERATURE)
-                put("messages", JSONArray().apply {
-                    put(JSONObject().apply {
-                        put("role", "system")
-                        put("content", systemPrompt)
-                    })
-                    put(JSONObject().apply {
-                        put("role", "user")
-                        put("content", userPrompt)
-                    })
-                })
+                put("messages", messagesArray)
             }
 
             val connection = URL(API_URL).openConnection() as HttpURLConnection
@@ -131,13 +149,23 @@ class ChatGPTService(private val preferencesManager: PreferencesManager) {
         }
     }
 
-    private fun buildSystemPrompt(config: PromptConfig): String {
+    private fun buildSystemPrompt(config: PromptConfig, hasHistory: Boolean = false): String {
         val toneDescription = when (config.replyTone) {
             ReplyTone.SALES -> "persuasive and sales-focused, aiming to close the deal"
             ReplyTone.FRIENDLY -> "warm, friendly, and approachable"
             ReplyTone.SHORT -> "brief and to the point, maximum 1-2 sentences"
             ReplyTone.PERSUASIVE -> "highly persuasive, emphasizing benefits and urgency"
         }
+
+        val historyNote = if (hasHistory) """
+CONVERSATION CONTEXT:
+- You have previous conversation history with this customer
+- Use the context to provide relevant, continuous responses
+- Remember what they asked before and what you told them
+- If they confirmed an order before, acknowledge it
+- Don't repeat information you already shared
+- Build on the existing conversation naturally
+""" else ""
 
         return """
 You are a helpful sales assistant for a marketplace seller specializing in cosmetic products.
@@ -147,7 +175,7 @@ ${config.customerProfile}
 
 PRODUCT CATEGORY:
 ${config.productCategory}
-
+$historyNote
 YOUR RESPONSE STYLE:
 - Be $toneDescription
 - Keep responses short (1-3 sentences max)
