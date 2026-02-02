@@ -12,9 +12,11 @@ import com.marketplace.autoreply.data.AppLogger
 import com.marketplace.autoreply.data.ChatGPTResult
 import com.marketplace.autoreply.data.ChatGPTService
 import com.marketplace.autoreply.data.ConversationMessage
+import com.marketplace.autoreply.data.LearningManager
 import com.marketplace.autoreply.data.MessageRole
 import com.marketplace.autoreply.data.RepliedUser
 import com.marketplace.autoreply.data.SpamDetector
+import com.marketplace.autoreply.data.SuccessType
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
@@ -256,6 +258,9 @@ class MessengerNotificationListener : NotificationListenerService() {
             )
         )
 
+        // Initialize learning manager
+        val learningManager = LearningManager(app.database.learningDao())
+
         if (isAIEnabled) {
             // Try ChatGPT first
             val apiKey = app.preferencesManager.openAIApiKey.first()
@@ -267,8 +272,16 @@ class MessengerNotificationListener : NotificationListenerService() {
                 // Fetch conversation history for context (last 8 messages)
                 val conversationHistory = app.database.conversationHistoryDao()
                     .getRecentMessages(senderId, limit = 8)
+
+                // Fetch successful examples for few-shot learning
+                val successfulExamples = learningManager.getFewShotExamples(limit = 3)
+
+                // Fetch recent replies to avoid repetition
+                val recentReplies = learningManager.getRecentReplies(senderId)
+
                 val historyCount = conversationHistory.size
-                AppLogger.info(TAG, "Calling ChatGPT with $historyCount history msgs...", showToast = true)
+                val examplesCount = successfulExamples.size
+                AppLogger.info(TAG, "ChatGPT: $historyCount history, $examplesCount examples", showToast = true)
 
                 when (val result = chatGPTService.generateReply(
                     senderName = title,
@@ -277,7 +290,9 @@ class MessengerNotificationListener : NotificationListenerService() {
                     fullNotification = fullText,
                     apiKey = apiKey,
                     promptConfig = promptConfig,
-                    conversationHistory = conversationHistory
+                    conversationHistory = conversationHistory,
+                    successfulExamples = successfulExamples,
+                    recentReplies = recentReplies
                 )) {
                     is ChatGPTResult.Success -> {
                         replyMessage = result.reply
@@ -296,8 +311,36 @@ class MessengerNotificationListener : NotificationListenerService() {
                             )
                         )
 
+                        // Track this reply to prevent repetition
+                        learningManager.trackReply(replyMessage, senderId)
+
+                        // Auto-detect success patterns and learn from them
+                        val lowerMessage = messageText.lowercase()
+                        if (lowerMessage.contains("ok") || lowerMessage.contains("نعم") ||
+                            lowerMessage.contains("واخا") || lowerMessage.contains("yes") ||
+                            lowerMessage.contains("أريد") || lowerMessage.contains("بغيت") ||
+                            lowerMessage.contains("order") || lowerMessage.contains("buy") ||
+                            lowerMessage.contains("اشتري") || lowerMessage.contains("confirm")) {
+                            // This looks like a positive response - learn from previous reply
+                            val previousReplies = conversationHistory.filter { it.role == MessageRole.ASSISTANT }
+                            if (previousReplies.isNotEmpty()) {
+                                val lastReply = previousReplies.first()
+                                val lastCustomerMsg = conversationHistory.filter { it.role == MessageRole.CUSTOMER }.getOrNull(1)
+                                if (lastCustomerMsg != null) {
+                                    learningManager.recordSuccess(
+                                        customerMessage = lastCustomerMsg.content,
+                                        ourReply = lastReply.content,
+                                        successType = SuccessType.POSITIVE_RESPONSE,
+                                        productContext = productTitle
+                                    )
+                                    AppLogger.info(TAG, "Learned from successful reply!", showToast = true)
+                                }
+                            }
+                        }
+
                         // Trim old messages to prevent database bloat
                         app.database.conversationHistoryDao().trimOldMessages(senderId, keepCount = 20)
+                        learningManager.cleanup()
                     }
                     is ChatGPTResult.Error -> {
                         // Fallback to static message

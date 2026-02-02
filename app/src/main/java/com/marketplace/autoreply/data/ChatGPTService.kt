@@ -34,6 +34,8 @@ class ChatGPTService(private val preferencesManager: PreferencesManager) {
      * @param apiKey The OpenAI API key
      * @param promptConfig The user-configured prompt settings
      * @param conversationHistory Previous messages with this customer (newest first)
+     * @param successfulExamples Few-shot examples of successful replies
+     * @param recentReplies Recent replies to avoid repetition
      * @return Generated reply text or null if failed
      */
     suspend fun generateReply(
@@ -43,14 +45,16 @@ class ChatGPTService(private val preferencesManager: PreferencesManager) {
         fullNotification: String,
         apiKey: String,
         promptConfig: PromptConfig,
-        conversationHistory: List<ConversationMessage> = emptyList()
+        conversationHistory: List<ConversationMessage> = emptyList(),
+        successfulExamples: List<SuccessfulReply> = emptyList(),
+        recentReplies: List<String> = emptyList()
     ): ChatGPTResult = withContext(Dispatchers.IO) {
         try {
             if (apiKey.isBlank()) {
                 return@withContext ChatGPTResult.Error("API key not configured")
             }
 
-            val systemPrompt = buildSystemPrompt(promptConfig, conversationHistory.isNotEmpty())
+            val systemPrompt = buildSystemPrompt(promptConfig, conversationHistory.isNotEmpty(), successfulExamples, recentReplies)
             val userPrompt = buildUserPrompt(senderName, productTitle, messageText, fullNotification)
 
             // Build messages array with conversation history
@@ -149,7 +153,12 @@ class ChatGPTService(private val preferencesManager: PreferencesManager) {
         }
     }
 
-    private fun buildSystemPrompt(config: PromptConfig, hasHistory: Boolean = false): String {
+    private fun buildSystemPrompt(
+        config: PromptConfig,
+        hasHistory: Boolean = false,
+        successfulExamples: List<SuccessfulReply> = emptyList(),
+        recentReplies: List<String> = emptyList()
+    ): String {
         val toneDescription = when (config.replyTone) {
             ReplyTone.SALES -> "persuasive and sales-focused, aiming to close the deal"
             ReplyTone.FRIENDLY -> "warm, friendly, and approachable"
@@ -167,34 +176,68 @@ CONVERSATION CONTEXT:
 - Build on the existing conversation naturally
 """ else ""
 
+        // Build few-shot examples from successful conversations
+        val examplesSection = if (successfulExamples.isNotEmpty()) {
+            val examples = successfulExamples.take(3).mapIndexed { index, ex ->
+                """
+Example ${index + 1} (This reply led to a sale!):
+Customer: "${ex.customerMessage.take(100)}"
+Good reply: "${ex.successfulResponse.take(150)}"
+"""
+            }.joinToString("\n")
+            """
+LEARN FROM THESE SUCCESSFUL REPLIES:
+$examples
+Use similar style and persuasion techniques in your response.
+"""
+        } else ""
+
+        // Anti-repetition section
+        val antiRepetitionNote = if (recentReplies.isNotEmpty()) {
+            val recentExamples = recentReplies.take(3).joinToString("\n- ")
+            """
+AVOID REPETITION - DO NOT use these phrases you recently used:
+- $recentExamples
+Create a FRESH, UNIQUE response with different wording.
+"""
+        } else ""
+
         return """
-You are a helpful sales assistant for a marketplace seller specializing in cosmetic products.
+You are an EXPERT sales assistant for a marketplace seller. Your goal is to CONVINCE customers to buy.
 
 CUSTOMER PROFILE:
 ${config.customerProfile}
 
 PRODUCT CATEGORY:
 ${config.productCategory}
-$historyNote
+$historyNote$examplesSection$antiRepetitionNote
+PERSUASION TECHNIQUES TO USE:
+- Create urgency: "This is selling fast" or "Limited stock available"
+- Social proof: "Many customers love this product"
+- Personal touch: Use their name, be warm and genuine
+- Handle objections: Address concerns directly and positively
+- Call to action: Guide them to the next step
+
 YOUR RESPONSE STYLE:
 - Be $toneDescription
 - Keep responses short (1-3 sentences max)
-- Sound natural and human, not robotic
-- If the product name is mentioned, include it in your reply
-- Answer the customer's question directly
-- Don't use excessive punctuation or emojis
-- Don't repeat the same phrases
-- Adapt your language based on how the customer writes
+- Sound natural and human, NEVER robotic
+- Match the customer's language style (formal/casual)
+- Show enthusiasm about the product
+- Make them feel special and valued
 - Never reveal you are an AI or automated system
-- Focus on helping the customer and closing the sale
 
-IMPORTANT RULES:
-- If asked about availability, confirm the product is available
-- If asked about price, say you'll provide details shortly
-- If asked about quality, praise the product genuinely
-- If asked about delivery, mention you can arrange it
-- Don't share contact info unless specifically asked
-- Keep it conversational and helpful
+SMART REPLY RULES:
+- "Is it available?" → "Yes! It's available and ready for you. Would you like me to reserve it?"
+- "What's the price?" → "I'll get you the best price! Can I share the details with you?"
+- "Is it good quality?" → "Absolutely! Our customers love it. Let me tell you why..."
+- "Can you deliver?" → "Yes, delivery is no problem! Where should I send it?"
+- Questions about payment → "We're flexible! What payment method works best for you?"
+
+CLOSING TECHNIQUES:
+- Ask assumptive questions: "When would you like to receive it?"
+- Offer choices: "Would you prefer the regular or large size?"
+- Create FOMO: "I have one customer also interested, should I hold it for you?"
 """.trim()
     }
 
