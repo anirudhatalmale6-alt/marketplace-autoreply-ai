@@ -1,0 +1,198 @@
+package com.marketplace.autoreply.data
+
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.withContext
+import org.json.JSONArray
+import org.json.JSONObject
+import java.io.BufferedReader
+import java.io.OutputStreamWriter
+import java.net.HttpURLConnection
+import java.net.URL
+
+/**
+ * ChatGPT API Service for generating intelligent auto-replies
+ * Uses OpenAI's GPT API to analyze incoming messages and generate
+ * contextual, sales-focused responses for cosmetic products.
+ */
+class ChatGPTService(private val preferencesManager: PreferencesManager) {
+
+    companion object {
+        private const val TAG = "ChatGPT"
+        private const val API_URL = "https://api.openai.com/v1/chat/completions"
+        private const val MODEL = "gpt-3.5-turbo"
+        private const val MAX_TOKENS = 150
+        private const val TEMPERATURE = 0.7
+    }
+
+    /**
+     * Generate a smart reply using ChatGPT based on the incoming message context
+     *
+     * @param senderName The name of the person who sent the message
+     * @param productTitle The product title extracted from notification (if available)
+     * @param messageText The actual message content
+     * @param fullNotification The full notification text for additional context
+     * @param apiKey The OpenAI API key
+     * @param promptConfig The user-configured prompt settings
+     * @return Generated reply text or null if failed
+     */
+    suspend fun generateReply(
+        senderName: String,
+        productTitle: String,
+        messageText: String,
+        fullNotification: String,
+        apiKey: String,
+        promptConfig: PromptConfig
+    ): ChatGPTResult = withContext(Dispatchers.IO) {
+        try {
+            if (apiKey.isBlank()) {
+                return@withContext ChatGPTResult.Error("API key not configured")
+            }
+
+            val systemPrompt = buildSystemPrompt(promptConfig)
+            val userPrompt = buildUserPrompt(senderName, productTitle, messageText, fullNotification)
+
+            val requestBody = JSONObject().apply {
+                put("model", MODEL)
+                put("max_tokens", MAX_TOKENS)
+                put("temperature", TEMPERATURE)
+                put("messages", JSONArray().apply {
+                    put(JSONObject().apply {
+                        put("role", "system")
+                        put("content", systemPrompt)
+                    })
+                    put(JSONObject().apply {
+                        put("role", "user")
+                        put("content", userPrompt)
+                    })
+                })
+            }
+
+            val connection = URL(API_URL).openConnection() as HttpURLConnection
+            connection.apply {
+                requestMethod = "POST"
+                setRequestProperty("Content-Type", "application/json")
+                setRequestProperty("Authorization", "Bearer $apiKey")
+                doOutput = true
+                connectTimeout = 30000
+                readTimeout = 30000
+            }
+
+            OutputStreamWriter(connection.outputStream).use { writer ->
+                writer.write(requestBody.toString())
+                writer.flush()
+            }
+
+            val responseCode = connection.responseCode
+            if (responseCode == HttpURLConnection.HTTP_OK) {
+                val response = connection.inputStream.bufferedReader().use(BufferedReader::readText)
+                val jsonResponse = JSONObject(response)
+                val choices = jsonResponse.getJSONArray("choices")
+                if (choices.length() > 0) {
+                    val reply = choices.getJSONObject(0)
+                        .getJSONObject("message")
+                        .getString("content")
+                        .trim()
+
+                    // Get usage info for logging
+                    val usage = jsonResponse.optJSONObject("usage")
+                    val tokensUsed = usage?.optInt("total_tokens") ?: 0
+
+                    AppLogger.info(TAG, "Reply generated (${tokensUsed} tokens)")
+                    return@withContext ChatGPTResult.Success(reply, tokensUsed)
+                }
+                return@withContext ChatGPTResult.Error("Empty response from API")
+            } else {
+                val errorStream = connection.errorStream?.bufferedReader()?.use { it.readText() } ?: "Unknown error"
+                AppLogger.error(TAG, "API Error $responseCode: $errorStream")
+                return@withContext ChatGPTResult.Error("API Error: $responseCode")
+            }
+        } catch (e: Exception) {
+            AppLogger.error(TAG, "Exception: ${e.message}")
+            return@withContext ChatGPTResult.Error("Error: ${e.message}")
+        }
+    }
+
+    private fun buildSystemPrompt(config: PromptConfig): String {
+        val toneDescription = when (config.replyTone) {
+            ReplyTone.SALES -> "persuasive and sales-focused, aiming to close the deal"
+            ReplyTone.FRIENDLY -> "warm, friendly, and approachable"
+            ReplyTone.SHORT -> "brief and to the point, maximum 1-2 sentences"
+            ReplyTone.PERSUASIVE -> "highly persuasive, emphasizing benefits and urgency"
+        }
+
+        return """
+You are a helpful sales assistant for a marketplace seller specializing in cosmetic products.
+
+CUSTOMER PROFILE:
+${config.customerProfile}
+
+PRODUCT CATEGORY:
+${config.productCategory}
+
+YOUR RESPONSE STYLE:
+- Be $toneDescription
+- Keep responses short (1-3 sentences max)
+- Sound natural and human, not robotic
+- If the product name is mentioned, include it in your reply
+- Answer the customer's question directly
+- Don't use excessive punctuation or emojis
+- Don't repeat the same phrases
+- Adapt your language based on how the customer writes
+- Never reveal you are an AI or automated system
+- Focus on helping the customer and closing the sale
+
+IMPORTANT RULES:
+- If asked about availability, confirm the product is available
+- If asked about price, say you'll provide details shortly
+- If asked about quality, praise the product genuinely
+- If asked about delivery, mention you can arrange it
+- Don't share contact info unless specifically asked
+- Keep it conversational and helpful
+""".trim()
+    }
+
+    private fun buildUserPrompt(
+        senderName: String,
+        productTitle: String,
+        messageText: String,
+        fullNotification: String
+    ): String {
+        return """
+New message received on marketplace:
+
+Sender: $senderName
+Product: ${productTitle.ifEmpty { "Not specified" }}
+Message: $messageText
+Full notification: $fullNotification
+
+Generate a helpful, natural-sounding reply that addresses their message. Keep it short and conversational.
+""".trim()
+    }
+}
+
+/**
+ * Result wrapper for ChatGPT API calls
+ */
+sealed class ChatGPTResult {
+    data class Success(val reply: String, val tokensUsed: Int) : ChatGPTResult()
+    data class Error(val message: String) : ChatGPTResult()
+}
+
+/**
+ * Configuration for ChatGPT prompt customization
+ */
+data class PromptConfig(
+    val customerProfile: String = "General marketplace buyers looking for quality cosmetic products at good prices.",
+    val productCategory: String = "Cosmetic and beauty products including skincare, haircare, beard care, and personal grooming items.",
+    val replyTone: ReplyTone = ReplyTone.SALES
+)
+
+/**
+ * Reply tone options
+ */
+enum class ReplyTone {
+    SALES,      // Persuasive, sales-focused
+    FRIENDLY,   // Warm and approachable
+    SHORT,      // Brief and concise
+    PERSUASIVE  // Highly persuasive with urgency
+}
