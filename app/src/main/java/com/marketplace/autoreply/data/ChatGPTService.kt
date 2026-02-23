@@ -9,64 +9,57 @@ import java.io.OutputStreamWriter
 import java.net.HttpURLConnection
 import java.net.URL
 
-/**
- * ChatGPT API Service for generating intelligent auto-replies
- * Uses OpenAI's GPT API to analyze incoming messages and generate
- * contextual, sales-focused responses for cosmetic products.
- */
 class ChatGPTService(private val preferencesManager: PreferencesManager) {
 
     companion object {
         private const val TAG = "ChatGPT"
         private const val API_URL = "https://api.openai.com/v1/chat/completions"
         private const val MODEL = "gpt-3.5-turbo"
-        private const val MAX_TOKENS = 150
+        private const val MAX_TOKENS = 200
         private const val TEMPERATURE = 0.7
     }
 
     /**
-     * Generate a smart reply using ChatGPT based on the incoming message context
-     *
-     * @param senderName The name of the person who sent the message
-     * @param productTitle The product title extracted from notification (if available)
-     * @param messageText The actual message content
-     * @param fullNotification The full notification text for additional context
-     * @param apiKey The OpenAI API key
-     * @param promptConfig The user-configured prompt settings
-     * @param conversationHistory Previous messages with this customer (newest first)
-     * @param successfulExamples Few-shot examples of successful replies
-     * @param recentReplies Recent replies to avoid repetition
-     * @return Generated reply text or null if failed
+     * Context object passed to ChatGPT with all relevant info
      */
+    data class MessageContext(
+        val senderName: String,
+        val productTitle: String,
+        val messageText: String,
+        val fullNotification: String,
+        val detectedIntent: String,
+        val matchedKeyword: String,
+        val conversationState: String,
+        val session: UserSession?,
+        val price: String = "",
+        val orderLink: String = "",
+        val phone: String = "",
+        val conversationHistory: List<ConversationMessage> = emptyList(),
+        val successfulExamples: List<SuccessfulReply> = emptyList(),
+        val recentReplies: List<String> = emptyList()
+    )
+
     suspend fun generateReply(
-        senderName: String,
-        productTitle: String,
-        messageText: String,
-        fullNotification: String,
+        context: MessageContext,
         apiKey: String,
-        promptConfig: PromptConfig,
-        conversationHistory: List<ConversationMessage> = emptyList(),
-        successfulExamples: List<SuccessfulReply> = emptyList(),
-        recentReplies: List<String> = emptyList()
+        promptConfig: PromptConfig
     ): ChatGPTResult = withContext(Dispatchers.IO) {
         try {
             if (apiKey.isBlank()) {
                 return@withContext ChatGPTResult.Error("API key not configured")
             }
 
-            val systemPrompt = buildSystemPrompt(promptConfig, conversationHistory.isNotEmpty(), successfulExamples, recentReplies)
-            val userPrompt = buildUserPrompt(senderName, productTitle, messageText, fullNotification)
+            val systemPrompt = buildSystemPrompt(promptConfig, context)
+            val userPrompt = buildUserPrompt(context)
 
-            // Build messages array with conversation history
             val messagesArray = JSONArray().apply {
-                // System prompt first
                 put(JSONObject().apply {
                     put("role", "system")
                     put("content", systemPrompt)
                 })
 
-                // Add conversation history (reversed to chronological order, oldest first)
-                val historyReversed = conversationHistory.reversed()
+                // Add conversation history (oldest first)
+                val historyReversed = context.conversationHistory.reversed()
                 for (msg in historyReversed) {
                     val role = if (msg.role == MessageRole.CUSTOMER) "user" else "assistant"
                     put(JSONObject().apply {
@@ -75,7 +68,6 @@ class ChatGPTService(private val preferencesManager: PreferencesManager) {
                     })
                 }
 
-                // Current message last
                 put(JSONObject().apply {
                     put("role", "user")
                     put("content", userPrompt)
@@ -114,11 +106,8 @@ class ChatGPTService(private val preferencesManager: PreferencesManager) {
                         .getJSONObject("message")
                         .getString("content")
                         .trim()
-
-                    // Get usage info for logging
                     val usage = jsonResponse.optJSONObject("usage")
                     val tokensUsed = usage?.optInt("total_tokens") ?: 0
-
                     AppLogger.info(TAG, "Reply generated (${tokensUsed} tokens)")
                     return@withContext ChatGPTResult.Success(reply, tokensUsed)
                 }
@@ -126,8 +115,6 @@ class ChatGPTService(private val preferencesManager: PreferencesManager) {
             } else {
                 val errorStream = connection.errorStream?.bufferedReader()?.use { it.readText() } ?: ""
                 AppLogger.error(TAG, "API Error $responseCode: $errorStream")
-
-                // Parse OpenAI error message for user-friendly display
                 val errorMessage = try {
                     val errorJson = JSONObject(errorStream)
                     errorJson.optJSONObject("error")?.optString("message") ?: "Unknown error"
@@ -153,136 +140,120 @@ class ChatGPTService(private val preferencesManager: PreferencesManager) {
         }
     }
 
-    private fun buildSystemPrompt(
-        config: PromptConfig,
-        hasHistory: Boolean = false,
-        successfulExamples: List<SuccessfulReply> = emptyList(),
-        recentReplies: List<String> = emptyList()
-    ): String {
-        val toneDescription = when (config.replyTone) {
-            ReplyTone.SALES -> "persuasive and sales-focused, aiming to close the deal"
-            ReplyTone.FRIENDLY -> "warm, friendly, and approachable"
-            ReplyTone.SHORT -> "brief and to the point, maximum 1-2 sentences"
-            ReplyTone.PERSUASIVE -> "highly persuasive, emphasizing benefits and urgency"
-        }
+    private fun buildSystemPrompt(config: PromptConfig, ctx: MessageContext): String {
+        val session = ctx.session
+        val hasHistory = ctx.conversationHistory.isNotEmpty()
 
-        val historyNote = if (hasHistory) """
-CONVERSATION CONTEXT:
-- You have previous conversation history with this customer
-- Use the context to provide relevant, continuous responses
-- Remember what they asked before and what you told them
-- If they confirmed an order before, acknowledge it
-- Don't repeat information you already shared
-- Build on the existing conversation naturally
+        // Build state context
+        val stateInfo = if (session != null) """
+SESSION STATE:
+- Conversation state: ${session.conversationState}
+- Greeting already sent: ${session.greetingSent}
+- Price already sent: ${session.priceSent}
+- Delivery info sent: ${session.deliveryInfoSent}
+- Effect info sent: ${session.effectInfoSent}
+- Order link sent: ${session.orderLinkSent}
+- Customer interested: ${session.interested}
+- Message count: ${session.messageCount}
 """ else ""
 
-        // Build few-shot examples from successful conversations
-        val examplesSection = if (successfulExamples.isNotEmpty()) {
-            val examples = successfulExamples.take(3).mapIndexed { index, ex ->
-                """
-Example ${index + 1} (This reply led to a sale!):
-Customer: "${ex.customerMessage.take(100)}"
-Good reply: "${ex.successfulResponse.take(150)}"
-"""
+        // Product info
+        val productInfo = if (ctx.productTitle.isNotEmpty()) """
+PRODUCT BEING DISCUSSED: "${ctx.productTitle}"
+Always mention this product by name in your reply.
+""" else ""
+
+        // Price/order info for the AI to use
+        val adminInfo = buildString {
+            if (ctx.price.isNotEmpty()) appendLine("PRODUCT PRICE: ${ctx.price}")
+            if (ctx.orderLink.isNotEmpty()) appendLine("ORDER LINK: ${ctx.orderLink}")
+            if (ctx.phone.isNotEmpty()) appendLine("PHONE/WHATSAPP: ${ctx.phone}")
+        }
+
+        // Anti-repeat based on session
+        val antiRepeat = buildString {
+            if (session?.priceSent == true && ctx.detectedIntent == CustomerIntent.PRICE)
+                appendLine("NOTE: Price was already sent. Don't repeat the full price. Instead say something like: 'كما قلت ليك، الثمن هو ${ctx.price}. بغيتي نأكد الطلب؟'")
+            if (session?.greetingSent == true && ctx.detectedIntent == CustomerIntent.GREETING)
+                appendLine("NOTE: Greeting was already sent. DO NOT greet again. Answer directly.")
+            if (session?.deliveryInfoSent == true && ctx.detectedIntent == CustomerIntent.DELIVERY)
+                appendLine("NOTE: Delivery info was already sent. Remind briefly and push for order confirmation.")
+        }
+
+        // Few-shot examples
+        val examplesSection = if (ctx.successfulExamples.isNotEmpty()) {
+            val examples = ctx.successfulExamples.take(3).mapIndexed { i, ex ->
+                "Example ${i + 1}: Customer: \"${ex.customerMessage.take(80)}\" → Reply: \"${ex.successfulResponse.take(120)}\""
             }.joinToString("\n")
-            """
-LEARN FROM THESE SUCCESSFUL REPLIES:
-$examples
-Use similar style and persuasion techniques in your response.
-"""
+            "\nSUCCESSFUL REPLY EXAMPLES:\n$examples\n"
         } else ""
 
-        // Anti-repetition section
-        val antiRepetitionNote = if (recentReplies.isNotEmpty()) {
-            val recentExamples = recentReplies.take(3).joinToString("\n- ")
-            """
-AVOID REPETITION - DO NOT use these phrases you recently used:
-- $recentExamples
-Create a FRESH, UNIQUE response with different wording.
-"""
+        // Anti-repetition
+        val recentNote = if (ctx.recentReplies.isNotEmpty()) {
+            "\nAVOID REPEATING:\n- ${ctx.recentReplies.take(3).joinToString("\n- ")}\nUse DIFFERENT wording.\n"
         } else ""
 
         return """
-You are an EXPERT sales assistant for a marketplace seller. Your goal is to CONVINCE customers to buy.
+أنت مساعد مبيعات خبير في Marketplace. هدفك هو إقناع العميل بالشراء.
 
-CUSTOMER PROFILE:
-${config.customerProfile}
+LANGUAGE: جاوب بالدارجة المغربية. إذا العميل كتب بالدارجة جاوب بالدارجة. إذا كتب بالفرنسية جاوب بالفرنسية.
 
-PRODUCT CATEGORY:
-${config.productCategory}
-$historyNote$examplesSection$antiRepetitionNote
-PERSUASION TECHNIQUES TO USE:
-- Create urgency: "This is selling fast" or "Limited stock available"
-- Social proof: "Many customers love this product"
-- Personal touch: Use their name, be warm and genuine
-- Handle objections: Address concerns directly and positively
-- Call to action: Guide them to the next step
+$productInfo
+${if (adminInfo.isNotEmpty()) "BUSINESS INFO:\n$adminInfo" else ""}
+$stateInfo
+DETECTED INTENT: ${ctx.detectedIntent} (keyword: "${ctx.matchedKeyword}")
+$antiRepeat$examplesSection$recentNote
+CRITICAL RULES:
+- لا تعاود التحية إذا سبق وبدأت المحادثة
+- إذا سأل العميل بكلمات دارجة قصيرة جاوب مباشرة
+- لا ترجع لرسالة عامة مثل "كيف أساعدك"
+- جاوب حسب السؤال فقط
+- كل رد ينتهي بسؤال إغلاق البيع: "بغيتي نأكد ليك الطلب؟" أو "نحجزه لك؟"
 
-YOUR RESPONSE STYLE:
-- Be $toneDescription
-- Keep responses short (1-3 sentences max)
-- Sound natural and human, NEVER robotic
-- Match the customer's language style (formal/casual)
-- Show enthusiasm about the product
-- Make them feel special and valued
-- Never reveal you are an AI or automated system
+INTENT-BASED REPLIES:
+- PRICE → اعطي الثمن مباشرة + اسأل عن تأكيد الطلب
+- DELIVERY → اعطي معلومات التوصيل + رابط الطلب
+- EFFECT → قول أنه فعال مع الاستعمال المنتظم + اسأل عن الطلب
+- USAGE → اشرح طريقة الاستعمال باختصار + اسأل عن الطلب
+- BUY/CONFIRM → أكد الطلب + اعطي رابط الطلب أو اطلب المعلومات
+- GREETING → رد قصير فقط: "وعليكم السلام 😊 تفضل، أنا معك"
+- AVAILABILITY → أكد التوفر + اسأل إذا بغى يطلب
 
-SMART REPLY RULES:
-- "Is it available?" → "Yes! It's available and ready for you. Would you like me to reserve it?"
-- "What's the price?" → "I'll get you the best price! Can I share the details with you?"
-- "Is it good quality?" → "Absolutely! Our customers love it. Let me tell you why..."
-- "Can you deliver?" → "Yes, delivery is no problem! Where should I send it?"
-- Questions about payment → "We're flexible! What payment method works best for you?"
-
-CLOSING TECHNIQUES:
-- Ask assumptive questions: "When would you like to receive it?"
-- Offer choices: "Would you prefer the regular or large size?"
-- Create FOMO: "I have one customer also interested, should I hold it for you?"
+STYLE:
+- ردود قصيرة (1-3 جمل)
+- طبيعي وإنساني
+- لا تكشف أنك AI
+- استخدم إيموجي بشكل خفيف (👍 🚚 😊)
 """.trim()
     }
 
-    private fun buildUserPrompt(
-        senderName: String,
-        productTitle: String,
-        messageText: String,
-        fullNotification: String
-    ): String {
+    private fun buildUserPrompt(ctx: MessageContext): String {
         return """
-New message received on marketplace:
+intent_detected: ${ctx.detectedIntent}
+product_title: "${ctx.productTitle.ifEmpty { "غير محدد" }}"
+conversation_state: ${ctx.session?.conversationState ?: ConversationState.NEW}
+message: "${ctx.messageText}"
+sender: ${ctx.senderName}
 
-Sender: $senderName
-Product: ${productTitle.ifEmpty { "Not specified" }}
-Message: $messageText
-Full notification: $fullNotification
-
-Generate a helpful, natural-sounding reply that addresses their message. Keep it short and conversational.
+اكتب رد مباشر وقصير حسب النية المكتشفة.
 """.trim()
     }
 }
 
-/**
- * Result wrapper for ChatGPT API calls
- */
 sealed class ChatGPTResult {
     data class Success(val reply: String, val tokensUsed: Int) : ChatGPTResult()
     data class Error(val message: String) : ChatGPTResult()
 }
 
-/**
- * Configuration for ChatGPT prompt customization
- */
 data class PromptConfig(
     val customerProfile: String = "General marketplace buyers looking for quality cosmetic products at good prices.",
     val productCategory: String = "Cosmetic and beauty products including skincare, haircare, beard care, and personal grooming items.",
     val replyTone: ReplyTone = ReplyTone.SALES
 )
 
-/**
- * Reply tone options
- */
 enum class ReplyTone {
-    SALES,      // Persuasive, sales-focused
-    FRIENDLY,   // Warm and approachable
-    SHORT,      // Brief and concise
-    PERSUASIVE  // Highly persuasive with urgency
+    SALES,
+    FRIENDLY,
+    SHORT,
+    PERSUASIVE
 }

@@ -39,9 +39,19 @@ class PreferencesManager(private val context: Context) {
         // Spam Detection Settings
         private val SPAM_DETECTION_ENABLED = booleanPreferencesKey("spam_detection_enabled")
 
+        // Admin Editable Settings (v5.0)
+        private val PRODUCT_PRICE = stringPreferencesKey("product_price")
+        private val ORDER_LINK = stringPreferencesKey("order_link")
+        private val PHONE_NUMBER = stringPreferencesKey("phone_number")
+        private val SILENCE_FOLLOWUP_SECONDS = intPreferencesKey("silence_followup_seconds")
+
         private val DEFAULT_MESSAGE = "Hi! Thanks for your interest. I'll get back to you shortly."
         private const val DEFAULT_MIN_DELAY = 8
         private const val DEFAULT_MAX_DELAY = 12
+        private const val DEFAULT_PRODUCT_PRICE = "200 درهم"
+        private const val DEFAULT_ORDER_LINK = ""
+        private const val DEFAULT_PHONE = ""
+        private const val DEFAULT_SILENCE_FOLLOWUP = 300 // 5 minutes
 
         // Default Stage 1 messages (welcome - no links/numbers)
         private val DEFAULT_STAGE1 = listOf(
@@ -111,6 +121,19 @@ class PreferencesManager(private val context: Context) {
 
     val isSpamDetectionEnabled: Flow<Boolean> = context.dataStore.data
         .map { preferences -> preferences[SPAM_DETECTION_ENABLED] ?: true }
+
+    // Admin Editable Settings (v5.0)
+    val productPrice: Flow<String> = context.dataStore.data
+        .map { preferences -> preferences[PRODUCT_PRICE] ?: DEFAULT_PRODUCT_PRICE }
+
+    val orderLink: Flow<String> = context.dataStore.data
+        .map { preferences -> preferences[ORDER_LINK] ?: DEFAULT_ORDER_LINK }
+
+    val phoneNumber: Flow<String> = context.dataStore.data
+        .map { preferences -> preferences[PHONE_NUMBER] ?: DEFAULT_PHONE }
+
+    val silenceFollowupSeconds: Flow<Int> = context.dataStore.data
+        .map { preferences -> preferences[SILENCE_FOLLOWUP_SECONDS] ?: DEFAULT_SILENCE_FOLLOWUP }
 
     // Legacy: Multiple messages separated by ||| delimiter (kept for backward compatibility)
     val replyMessages: Flow<List<String>> = context.dataStore.data
@@ -204,6 +227,30 @@ class PreferencesManager(private val context: Context) {
     suspend fun setSpamDetectionEnabled(enabled: Boolean) {
         context.dataStore.edit { preferences ->
             preferences[SPAM_DETECTION_ENABLED] = enabled
+        }
+    }
+
+    suspend fun setProductPrice(price: String) {
+        context.dataStore.edit { preferences ->
+            preferences[PRODUCT_PRICE] = price
+        }
+    }
+
+    suspend fun setOrderLink(link: String) {
+        context.dataStore.edit { preferences ->
+            preferences[ORDER_LINK] = link
+        }
+    }
+
+    suspend fun setPhoneNumber(phone: String) {
+        context.dataStore.edit { preferences ->
+            preferences[PHONE_NUMBER] = phone
+        }
+    }
+
+    suspend fun setSilenceFollowupSeconds(seconds: Int) {
+        context.dataStore.edit { preferences ->
+            preferences[SILENCE_FOLLOWUP_SECONDS] = seconds
         }
     }
 

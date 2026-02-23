@@ -12,11 +12,15 @@ import com.marketplace.autoreply.data.AppLogger
 import com.marketplace.autoreply.data.ChatGPTResult
 import com.marketplace.autoreply.data.ChatGPTService
 import com.marketplace.autoreply.data.ConversationMessage
+import com.marketplace.autoreply.data.ConversationState
+import com.marketplace.autoreply.data.CustomerIntent
+import com.marketplace.autoreply.data.DarijaIntentDetector
 import com.marketplace.autoreply.data.LearningManager
 import com.marketplace.autoreply.data.MessageRole
 import com.marketplace.autoreply.data.RepliedUser
 import com.marketplace.autoreply.data.SpamDetector
 import com.marketplace.autoreply.data.SuccessType
+import com.marketplace.autoreply.data.UserSession
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
@@ -202,36 +206,26 @@ class MessengerNotificationListener : NotificationListenerService() {
             }
         }
 
-        // Check if AI mode is enabled FIRST - AI mode has no stage limits
+        // Check if AI mode is enabled
         val isAIEnabled = app.preferencesManager.isAIEnabled.first()
 
-        // Get existing user record to determine current stage
+        // Get existing user record for stage tracking (static mode)
         val existingUser = app.database.repliedUserDao().getUser(senderId)
-        val currentStage = existingUser?.currentStage ?: 0 // 0 means new user
-
-        // Determine next stage - but ONLY enforce limits in static mode
-        val nextStage = when (currentStage) {
-            0 -> 1  // New user -> Stage 1 (Welcome)
-            1 -> 2  // Was at Stage 1 -> Stage 2 (Follow-up)
-            2 -> 3  // Was at Stage 2 -> Stage 3 (Contact sharing)
-            3 -> {
-                // In AI mode, continue replying without limits
-                if (isAIEnabled) {
-                    AppLogger.info(TAG, "AI Mode: continuing conversation (no stage limit)")
-                    3 // Stay at stage 3, but continue replying
-                } else {
-                    // Static mode: stop after 3 stages
+        val currentStage = existingUser?.currentStage ?: 0
+        val nextStage = if (isAIEnabled) {
+            // AI mode: no stage limits
+            if (currentStage >= 3) 3 else currentStage + 1
+        } else {
+            // Static mode: enforce 3-stage limit
+            when (currentStage) {
+                0 -> 1; 1 -> 2; 2 -> 3
+                3 -> {
                     AppLogger.info(TAG, "All stages completed for $title")
                     app.database.activityLogDao().updateError(logId, ActivityStatus.IGNORED, "All stages completed")
                     synchronized(processLock) { processingSet.remove(senderId) }
                     return
                 }
-            }
-            else -> {
-                if (isAIEnabled) {
-                    1 // Reset to stage 1 in AI mode
-                } else {
-                    AppLogger.info(TAG, "Invalid stage for $title")
+                else -> {
                     app.database.activityLogDao().updateError(logId, ActivityStatus.IGNORED, "Invalid stage")
                     synchronized(processLock) { processingSet.remove(senderId) }
                     return
@@ -239,13 +233,9 @@ class MessengerNotificationListener : NotificationListenerService() {
             }
         }
 
-        AppLogger.info(TAG, "Stage $currentStage -> $nextStage for $title (AI: $isAIEnabled)", showToast = true)
-
-        // Check available methods
+        // Check available reply methods
         val hasReplyActionAvailable = NotificationReplyHelper.hasReplyAction(notification)
         val hasAccessibility = MessengerAccessibilityService.instance != null
-        AppLogger.info(TAG, "Reply action: $hasReplyActionAvailable, Accessibility: $hasAccessibility")
-
         if (!hasReplyActionAvailable && !hasAccessibility) {
             AppLogger.warn(TAG, "No reply method available!", showToast = true)
             app.database.activityLogDao().updateError(logId, ActivityStatus.ERROR, "No reply method available")
@@ -253,13 +243,12 @@ class MessengerNotificationListener : NotificationListenerService() {
             return
         }
 
-        // Determine reply message - AI or Static (isAIEnabled already checked above)
         var replyMessage: String
         var usedAI = false
         var tokensUsed = 0
-        var aiError: String? = null  // Track AI errors for logging
+        var aiError: String? = null
 
-        // Save incoming customer message to conversation history
+        // Save incoming message to conversation history
         app.database.conversationHistoryDao().insert(
             ConversationMessage(
                 customerId = senderId,
@@ -270,42 +259,74 @@ class MessengerNotificationListener : NotificationListenerService() {
             )
         )
 
-        // Initialize learning manager
         val learningManager = LearningManager(app.database.learningDao())
+        val intentDetector = DarijaIntentDetector()
 
         if (isAIEnabled) {
-            // Try ChatGPT first
             val apiKey = app.preferencesManager.openAIApiKey.first()
-            AppLogger.info(TAG, "AI Mode ON, API Key: ${if (apiKey.length > 10) "${apiKey.take(8)}...${apiKey.takeLast(4)}" else "NOT SET"}", showToast = true)
 
             if (apiKey.isNotBlank()) {
-                val promptConfig = app.preferencesManager.getPromptConfig()
+                // === V5.0 PIPELINE ===
 
-                // Fetch conversation history for context (last 8 messages)
+                // Step 1: Detect intent from Darija/French/Arabic keywords
+                val detectedIntent = intentDetector.detectIntent(messageText)
+                AppLogger.info(TAG, "Intent: ${detectedIntent.intent} (${detectedIntent.matchedKeyword})", showToast = true)
+
+                // Step 2: Get/create user session
+                var session = app.database.userSessionDao().getSession(senderId)
+                if (session == null) {
+                    session = UserSession(
+                        userId = senderId,
+                        customerName = title,
+                        productType = productTitle,
+                        conversationState = ConversationState.NEW
+                    )
+                    app.database.userSessionDao().upsert(session)
+                }
+                app.database.userSessionDao().incrementMessageCount(senderId)
+
+                // Update product type if we have one
+                if (productTitle.isNotEmpty() && session.productType.isEmpty()) {
+                    app.database.userSessionDao().updateProductType(senderId, productTitle)
+                    session = session.copy(productType = productTitle)
+                }
+
+                // Step 3: Update session intent
+                app.database.userSessionDao().updateIntent(senderId, detectedIntent.intent)
+
+                // Step 4: Fetch admin settings
+                val price = app.preferencesManager.productPrice.first()
+                val orderLink = app.preferencesManager.orderLink.first()
+                val phone = app.preferencesManager.phoneNumber.first()
+
+                // Step 5: Fetch context data
                 val conversationHistory = app.database.conversationHistoryDao()
                     .getRecentMessages(senderId, limit = 8)
-
-                // Fetch successful examples for few-shot learning
                 val successfulExamples = learningManager.getFewShotExamples(limit = 3)
-
-                // Fetch recent replies to avoid repetition
                 val recentReplies = learningManager.getRecentReplies(senderId)
+                val promptConfig = app.preferencesManager.getPromptConfig()
 
-                val historyCount = conversationHistory.size
-                val examplesCount = successfulExamples.size
-                AppLogger.info(TAG, "ChatGPT: $historyCount history, $examplesCount examples", showToast = true)
+                AppLogger.info(TAG, "State: ${session.conversationState}, History: ${conversationHistory.size}", showToast = true)
 
-                when (val result = chatGPTService.generateReply(
+                // Step 6: Build context and call ChatGPT
+                val msgContext = ChatGPTService.MessageContext(
                     senderName = title,
-                    productTitle = productTitle,
+                    productTitle = productTitle.ifEmpty { session.productType },
                     messageText = messageText,
                     fullNotification = fullText,
-                    apiKey = apiKey,
-                    promptConfig = promptConfig,
+                    detectedIntent = detectedIntent.intent,
+                    matchedKeyword = detectedIntent.matchedKeyword,
+                    conversationState = session.conversationState,
+                    session = session,
+                    price = price,
+                    orderLink = orderLink,
+                    phone = phone,
                     conversationHistory = conversationHistory,
                     successfulExamples = successfulExamples,
                     recentReplies = recentReplies
-                )) {
+                )
+
+                when (val result = chatGPTService.generateReply(msgContext, apiKey, promptConfig)) {
                     is ChatGPTResult.Success -> {
                         replyMessage = result.reply
                         usedAI = true
@@ -323,52 +344,64 @@ class MessengerNotificationListener : NotificationListenerService() {
                             )
                         )
 
-                        // Track this reply to prevent repetition
+                        // Track reply for anti-repetition
                         learningManager.trackReply(replyMessage, senderId)
 
-                        // Auto-detect success patterns and learn from them
-                        val lowerMessage = messageText.lowercase()
-                        if (lowerMessage.contains("ok") || lowerMessage.contains("نعم") ||
-                            lowerMessage.contains("واخا") || lowerMessage.contains("yes") ||
-                            lowerMessage.contains("أريد") || lowerMessage.contains("بغيت") ||
-                            lowerMessage.contains("order") || lowerMessage.contains("buy") ||
-                            lowerMessage.contains("اشتري") || lowerMessage.contains("confirm")) {
-                            // This looks like a positive response - learn from previous reply
-                            val previousReplies = conversationHistory.filter { it.role == MessageRole.ASSISTANT }
-                            if (previousReplies.isNotEmpty()) {
-                                val lastReply = previousReplies.first()
-                                val lastCustomerMsg = conversationHistory.filter { it.role == MessageRole.CUSTOMER }.getOrNull(1)
-                                if (lastCustomerMsg != null) {
+                        // Step 7: Update session state based on intent
+                        when (detectedIntent.intent) {
+                            CustomerIntent.GREETING -> {
+                                app.database.userSessionDao().markGreetingSent(senderId)
+                            }
+                            CustomerIntent.PRICE -> {
+                                app.database.userSessionDao().markPriceSent(senderId)
+                                app.database.userSessionDao().updateState(senderId, ConversationState.PRICE_GIVEN)
+                            }
+                            CustomerIntent.DELIVERY -> {
+                                app.database.userSessionDao().markDeliveryInfoSent(senderId)
+                                app.database.userSessionDao().updateState(senderId, ConversationState.DELIVERY_ASKED)
+                            }
+                            CustomerIntent.EFFECT -> {
+                                app.database.userSessionDao().markEffectInfoSent(senderId)
+                                app.database.userSessionDao().updateState(senderId, ConversationState.EFFECT_ASKED)
+                            }
+                            CustomerIntent.USAGE -> {
+                                app.database.userSessionDao().markUsageInfoSent(senderId)
+                                app.database.userSessionDao().updateState(senderId, ConversationState.USAGE_ASKED)
+                            }
+                            CustomerIntent.BUY, CustomerIntent.CONFIRM -> {
+                                app.database.userSessionDao().markInterested(senderId)
+                                app.database.userSessionDao().markOrderLinkSent(senderId)
+                                // Learn from previous reply that led to this
+                                val prevReplies = conversationHistory.filter { it.role == MessageRole.ASSISTANT }
+                                val prevCustomerMsgs = conversationHistory.filter { it.role == MessageRole.CUSTOMER }
+                                if (prevReplies.isNotEmpty() && prevCustomerMsgs.size > 1) {
                                     learningManager.recordSuccess(
-                                        customerMessage = lastCustomerMsg.content,
-                                        ourReply = lastReply.content,
-                                        successType = SuccessType.POSITIVE_RESPONSE,
+                                        customerMessage = prevCustomerMsgs[1].content,
+                                        ourReply = prevReplies.first().content,
+                                        successType = SuccessType.ORDER_CONFIRMED,
                                         productContext = productTitle
                                     )
-                                    AppLogger.info(TAG, "Learned from successful reply!", showToast = true)
+                                    AppLogger.info(TAG, "Learned: reply led to BUY intent!", showToast = true)
                                 }
                             }
                         }
 
-                        // Trim old messages to prevent database bloat
+                        app.database.userSessionDao().updateLastReplyTime(senderId)
                         app.database.conversationHistoryDao().trimOldMessages(senderId, keepCount = 20)
                         learningManager.cleanup()
                     }
                     is ChatGPTResult.Error -> {
-                        // Fallback to static message
                         aiError = result.message
                         AppLogger.error(TAG, "ChatGPT ERROR: $aiError", showToast = true)
                         replyMessage = getStaticMessage(app, nextStage)
                     }
                 }
             } else {
-                // API key not set, use static
                 aiError = "API key not configured"
                 AppLogger.warn(TAG, "API key NOT SET - using static", showToast = true)
                 replyMessage = getStaticMessage(app, nextStage)
             }
         } else {
-            // AI disabled, use static 3-stage messages
             AppLogger.info(TAG, "AI Mode OFF - using static", showToast = true)
             replyMessage = getStaticMessage(app, nextStage)
         }

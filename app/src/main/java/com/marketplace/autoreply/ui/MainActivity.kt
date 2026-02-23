@@ -231,6 +231,20 @@ class MainActivity : AppCompatActivity() {
                 .show()
         }
 
+        // Save Business Settings button (v5.0)
+        binding.btnSaveBusinessSettings.setOnClickListener {
+            val price = binding.editProductPrice.text.toString().trim()
+            val orderLink = binding.editOrderLink.text.toString().trim()
+            val phone = binding.editPhoneNumber.text.toString().trim()
+
+            lifecycleScope.launch {
+                app.preferencesManager.setProductPrice(price.ifEmpty { "200 درهم" })
+                app.preferencesManager.setOrderLink(orderLink)
+                app.preferencesManager.setPhoneNumber(phone)
+                Toast.makeText(this@MainActivity, "Business Settings saved", Toast.LENGTH_SHORT).show()
+            }
+        }
+
         // Clear logs button
         binding.btnClearLogs.setOnClickListener {
             lifecycleScope.launch {
@@ -391,6 +405,31 @@ class MainActivity : AppCompatActivity() {
             app.preferencesManager.maxDelaySeconds.collectLatest { maxDelay ->
                 if (binding.editMaxDelay.text.toString() != maxDelay.toString()) {
                     binding.editMaxDelay.setText(maxDelay.toString())
+                }
+            }
+        }
+
+        // Observe Business Settings (v5.0)
+        lifecycleScope.launch {
+            app.preferencesManager.productPrice.collectLatest { price ->
+                if (binding.editProductPrice.text.toString() != price) {
+                    binding.editProductPrice.setText(price)
+                }
+            }
+        }
+
+        lifecycleScope.launch {
+            app.preferencesManager.orderLink.collectLatest { link ->
+                if (binding.editOrderLink.text.toString() != link) {
+                    binding.editOrderLink.setText(link)
+                }
+            }
+        }
+
+        lifecycleScope.launch {
+            app.preferencesManager.phoneNumber.collectLatest { phone ->
+                if (binding.editPhoneNumber.text.toString() != phone) {
+                    binding.editPhoneNumber.setText(phone)
                 }
             }
         }
